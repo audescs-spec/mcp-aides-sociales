@@ -118,9 +118,11 @@ démarrer si elle n'est pas définie.
 ## Déploiement
 
 - `render.yaml` : configuration prête pour un déploiement sur
-  [Render.com](https://render.com) (type "Blueprint"). Pensez à définir
-  la variable d'environnement `API_KEY` dans le tableau de bord Render
-  (onglet "Environment"), elle n'est pas incluse dans ce fichier pour des
-  raisons de sécurité.
+  [Render.com](https://render.com) (type "Blueprint"). La variable
+  `API_KEY` y est déclarée avec `sync: false` : sa valeur n'est pas
+  incluse dans ce fichier (raisons de sécurité) et doit être saisie une
+  fois manuellement dans le tableau de bord Render, sur la page du
+  service (elle reste éditable même si le service est "Blueprint
+  managed").
 - `nixpacks.toml` / `Procfile` : configuration prête pour
   [Railway.app](https://railway.app) (même remarque pour `API_KEY`).
