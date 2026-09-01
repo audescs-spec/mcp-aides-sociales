@@ -76,15 +76,66 @@ async def _accueil(request):
     )
 
 
+class _AuthentificationParCle:
+    """Exige une cle d'acces (API key) sur toutes les routes sauf la page d'accueil "/".
+
+    La cle attendue est lue dans la variable d'environnement API_KEY. Elle doit
+    etre fournie par le client soit dans l'en-tete "X-API-Key", soit dans
+    l'en-tete "Authorization: Bearer <cle>".
+    """
+
+    def __init__(self, app, cle_attendue: str) -> None:
+        self._app = app
+        self._cle_attendue = cle_attendue
+
+    async def __call__(self, scope, receive, send):
+        import hmac
+
+        from starlette.responses import PlainTextResponse
+
+        if scope["type"] != "http" or scope["path"] == "/":
+            await self._app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        cle_fournie = headers.get(b"x-api-key", b"").decode()
+        if not cle_fournie:
+            auth = headers.get(b"authorization", b"").decode()
+            if auth.lower().startswith("bearer "):
+                cle_fournie = auth[7:].strip()
+
+        if not cle_fournie or not hmac.compare_digest(cle_fournie, self._cle_attendue):
+            response = PlainTextResponse(
+                "Cle d'acces manquante ou invalide. Fournissez l'en-tete "
+                "'X-API-Key' ou 'Authorization: Bearer <cle>'.",
+                status_code=401,
+            )
+            await response(scope, receive, send)
+            return
+
+        await self._app(scope, receive, send)
+
+
 def main() -> None:
+    import sys
+
     import uvicorn
-    from starlette.routing import Route
 
     port = int(os.environ.get("PORT", "8000"))
     host = "0.0.0.0"
+    cle_api = os.environ.get("API_KEY")
+
+    if not cle_api:
+        print(
+            "ERREUR: la variable d'environnement API_KEY n'est pas definie. "
+            "Le serveur refuse de demarrer sans cle d'acces configuree.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     app = server.streamable_http_app(host=host)
     app.add_route("/", _accueil, methods=["GET"])
+    app = _AuthentificationParCle(app, cle_api)
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
