@@ -4,12 +4,36 @@ Tout le calcul se fait en local avec la bibliotheque openfisca-france
 (SimulationBuilder d'openfisca-core). Aucun appel reseau n'est effectue.
 """
 
+import math
 from datetime import date
 
 from openfisca_core.simulation_builder import SimulationBuilder
 from openfisca_france import CountryTaxBenefitSystem
 
 _TBS = CountryTaxBenefitSystem()
+
+# Bornes de validation. Elles n'ont pas de sens "metier" precis : elles
+# servent uniquement a rejeter les entrees absurdes ou malveillantes (ex:
+# nombre_enfants=1000000) qui feraient construire une simulation openfisca
+# demesuree et pourraient ralentir ou faire planter le serveur.
+_NOMBRE_ENFANTS_MAX = 15
+_MONTANT_MAX = 200_000.0
+
+
+def _valider_montant(nom: str, valeur, obligatoire: bool = True) -> float:
+    if valeur is None:
+        if obligatoire:
+            raise ValueError(f"{nom} est obligatoire")
+        return 0.0
+    if isinstance(valeur, bool) or not isinstance(valeur, (int, float)):
+        raise ValueError(f"{nom} doit etre un nombre")
+    if not math.isfinite(valeur):
+        raise ValueError(f"{nom} doit etre un nombre fini")
+    if valeur < 0:
+        raise ValueError(f"{nom} ne peut pas etre negatif")
+    if valeur > _MONTANT_MAX:
+        raise ValueError(f"{nom} depasse la limite autorisee ({_MONTANT_MAX})")
+    return float(valeur)
 
 
 def _mois_precedents(mois: str, n: int) -> list[str]:
@@ -43,14 +67,27 @@ def calculer_rsa_prime_activite(
     (age adulte suppose 30 ans, enfants supposes non etudiants et a charge,
     revenus supposes stables sur les 3 derniers mois pour la prime d'activite).
     """
+    salaire_net_mensuel = _valider_montant("salaire_net_mensuel", salaire_net_mensuel)
+    loyer_mensuel = _valider_montant("loyer_mensuel", loyer_mensuel)
+    salaire_net_mensuel_conjoint = _valider_montant(
+        "salaire_net_mensuel_conjoint", salaire_net_mensuel_conjoint, obligatoire=False
+    )
+
+    if isinstance(nombre_enfants, bool) or not isinstance(nombre_enfants, int):
+        raise ValueError("nombre_enfants doit etre un entier")
     if nombre_enfants < 0:
         raise ValueError("nombre_enfants ne peut pas etre negatif")
+    if nombre_enfants > _NOMBRE_ENFANTS_MAX:
+        raise ValueError(f"nombre_enfants depasse la limite autorisee ({_NOMBRE_ENFANTS_MAX})")
+
+    if not isinstance(en_couple, bool):
+        raise ValueError("en_couple doit etre vrai ou faux")
 
     statuts_valides = {
         "primo_accedant", "proprietaire", "locataire_hlm", "locataire_vide",
         "locataire_meuble", "loge_gratuitement", "locataire_foyer", "sans_domicile",
     }
-    if statut_occupation_logement not in statuts_valides:
+    if not isinstance(statut_occupation_logement, str) or statut_occupation_logement not in statuts_valides:
         raise ValueError(
             f"statut_occupation_logement invalide: {statut_occupation_logement!r}. "
             f"Valeurs possibles: {sorted(statuts_valides)}"

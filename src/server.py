@@ -12,6 +12,7 @@ par la variable d'environnement PORT (8000 par defaut), accessible sur /mcp.
 
 import hashlib
 import os
+from collections import deque
 
 from mcp.server.mcpserver import MCPServer
 
@@ -76,6 +77,11 @@ def calculer_aides_sociales(
         )
     except ValueError as erreur:
         return {"erreur": str(erreur)}
+    except Exception:
+        # Filet de securite: une erreur inattendue (bug, cas limite non
+        # prevu dans openfisca-france...) ne doit jamais faire planter le
+        # serveur ni exposer de details internes au client.
+        return {"erreur": "Une erreur inattendue est survenue lors du calcul."}
 
 
 async def _accueil(request):
@@ -129,6 +135,61 @@ class _AuthentificationParCle:
         await self._app(scope, receive, send)
 
 
+class _LimitationDebit:
+    """Limite le nombre de requetes par adresse IP.
+
+    Protection simple contre un usage repete abusif (volontaire ou par
+    erreur, par exemple un client qui boucle) sur ce service heberge sur un
+    plan gratuit avec des ressources limitees. L'historique est garde en
+    memoire du processus: suffisant tant qu'une seule instance du serveur
+    tourne (cas du plan gratuit Render), mais ne serait pas partage entre
+    plusieurs instances si on passait a un plan avec plusieurs machines.
+    """
+
+    def __init__(self, app, max_requetes: int = 30, fenetre_secondes: float = 60.0) -> None:
+        self._app = app
+        self._max_requetes = max_requetes
+        self._fenetre = fenetre_secondes
+        self._historique: dict[str, deque] = {}
+
+    def _ip_client(self, scope) -> str:
+        headers = dict(scope.get("headers") or [])
+        cf_ip = headers.get(b"cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.decode()
+        xff = headers.get(b"x-forwarded-for")
+        if xff:
+            return xff.decode().split(",")[0].strip()
+        client = scope.get("client")
+        return client[0] if client else "inconnu"
+
+    async def __call__(self, scope, receive, send):
+        import time
+
+        from starlette.responses import PlainTextResponse
+
+        if scope["type"] != "http" or scope["path"] == "/":
+            await self._app(scope, receive, send)
+            return
+
+        ip = self._ip_client(scope)
+        maintenant = time.monotonic()
+        historique = self._historique.setdefault(ip, deque())
+        while historique and maintenant - historique[0] > self._fenetre:
+            historique.popleft()
+
+        if len(historique) >= self._max_requetes:
+            response = PlainTextResponse(
+                "Trop de requetes recues de votre part. Merci de reessayer dans une minute.",
+                status_code=429,
+            )
+            await response(scope, receive, send)
+            return
+
+        historique.append(maintenant)
+        await self._app(scope, receive, send)
+
+
 def main() -> None:
     import uvicorn
 
@@ -149,6 +210,7 @@ def main() -> None:
     app = server.streamable_http_app(host=host)
     app.add_route("/", _accueil, methods=["GET"])
     app = _AuthentificationParCle(app, empreinte_attendue)
+    app = _LimitationDebit(app)
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
