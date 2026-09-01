@@ -133,6 +133,17 @@ Pour changer définitivement la clé par défaut : calculez l'empreinte
 SHA-256 de la nouvelle clé et remplacez la constante
 `_EMPREINTE_CLE_API_PAR_DEFAUT` dans `src/server.py`.
 
+## Protections en place
+
+- **Clé d'accès obligatoire** (voir ci-dessus) sur tous les appels de calcul.
+- **Validation stricte des données reçues** (montants, nombre d'enfants,
+  types) : toute requête malformée ou avec des valeurs absurdes est
+  rejetée proprement, sans jamais faire planter le serveur.
+- **Limitation du nombre de requêtes par adresse IP** (au-delà d'un
+  certain nombre d'appels par minute, le serveur répond "trop de
+  requêtes" au lieu de traiter la demande), pour éviter qu'un usage
+  répété abusif ne surcharge ce service hébergé sur un plan gratuit.
+
 ## Déploiement
 
 - `render.yaml` : configuration prête pour un déploiement sur
