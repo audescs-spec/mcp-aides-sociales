@@ -10,11 +10,21 @@ Le serveur ecoute en HTTP (transport "streamable-http") sur le port defini
 par la variable d'environnement PORT (8000 par defaut), accessible sur /mcp.
 """
 
+import hashlib
 import os
 
 from mcp.server.mcpserver import MCPServer
 
 from calcul import calculer_rsa_prime_activite
+
+# Empreinte SHA-256 de la cle d'acces par defaut du service (pas la cle en
+# clair : impossible de retrouver la cle a partir de cette empreinte).
+# Sert de secours si aucune variable d'environnement n'est fournie par
+# l'hebergeur (utile sur Render en mode "Blueprint managed", ou l'onglet
+# Environment n'est pas toujours disponible pour ajouter une variable).
+_EMPREINTE_CLE_API_PAR_DEFAUT = (
+    "5a4271cb5924d0a7de20eefed2979c4a5994c810de0faeab291576ca5af39d08"
+)
 
 server = MCPServer(
     name="aides-sociales-france",
@@ -79,14 +89,15 @@ async def _accueil(request):
 class _AuthentificationParCle:
     """Exige une cle d'acces (API key) sur toutes les routes sauf la page d'accueil "/".
 
-    La cle attendue est lue dans la variable d'environnement API_KEY. Elle doit
-    etre fournie par le client soit dans l'en-tete "X-API-Key", soit dans
-    l'en-tete "Authorization: Bearer <cle>".
+    La cle fournie par le client (en-tete "X-API-Key", ou "Authorization:
+    Bearer <cle>") est hachee en SHA-256 puis comparee a l'empreinte
+    attendue. La cle en clair n'est jamais stockee ni comparee directement,
+    ce qui permet de garder l'empreinte dans le code source sans risque.
     """
 
-    def __init__(self, app, cle_attendue: str) -> None:
+    def __init__(self, app, empreinte_attendue: str) -> None:
         self._app = app
-        self._cle_attendue = cle_attendue
+        self._empreinte_attendue = empreinte_attendue
 
     async def __call__(self, scope, receive, send):
         import hmac
@@ -104,7 +115,9 @@ class _AuthentificationParCle:
             if auth.lower().startswith("bearer "):
                 cle_fournie = auth[7:].strip()
 
-        if not cle_fournie or not hmac.compare_digest(cle_fournie, self._cle_attendue):
+        empreinte_fournie = hashlib.sha256(cle_fournie.encode()).hexdigest()
+
+        if not cle_fournie or not hmac.compare_digest(empreinte_fournie, self._empreinte_attendue):
             response = PlainTextResponse(
                 "Cle d'acces manquante ou invalide. Fournissez l'en-tete "
                 "'X-API-Key' ou 'Authorization: Bearer <cle>'.",
@@ -117,25 +130,25 @@ class _AuthentificationParCle:
 
 
 def main() -> None:
-    import sys
-
     import uvicorn
 
     port = int(os.environ.get("PORT", "8000"))
     host = "0.0.0.0"
-    cle_api = os.environ.get("API_KEY")
 
-    if not cle_api:
-        print(
-            "ERREUR: la variable d'environnement API_KEY n'est pas definie. "
-            "Le serveur refuse de demarrer sans cle d'acces configuree.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
+    # Priorite: API_KEY_SHA256 (empreinte deja calculee) > API_KEY (cle en
+    # clair, hachee ici) > empreinte par defaut codee en dur ci-dessus.
+    empreinte_env = os.environ.get("API_KEY_SHA256")
+    cle_en_clair_env = os.environ.get("API_KEY")
+    if empreinte_env:
+        empreinte_attendue = empreinte_env.strip().lower()
+    elif cle_en_clair_env:
+        empreinte_attendue = hashlib.sha256(cle_en_clair_env.encode()).hexdigest()
+    else:
+        empreinte_attendue = _EMPREINTE_CLE_API_PAR_DEFAUT
 
     app = server.streamable_http_app(host=host)
     app.add_route("/", _accueil, methods=["GET"])
-    app = _AuthentificationParCle(app, cle_api)
+    app = _AuthentificationParCle(app, empreinte_attendue)
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 

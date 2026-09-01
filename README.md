@@ -111,18 +111,32 @@ API_KEY=une-cle-secrete-a-vous python src/server.py
 ```
 
 Le serveur écoute en HTTP sur le port défini par la variable
-d'environnement `PORT` (8000 par défaut), sur le chemin `/mcp`. La
-variable d'environnement `API_KEY` est obligatoire : le serveur refuse de
-démarrer si elle n'est pas définie.
+d'environnement `PORT` (8000 par défaut), sur le chemin `/mcp`.
+
+## Comment fonctionne la clé d'accès
+
+Le serveur ne stocke jamais la clé en clair : le code contient uniquement
+son **empreinte SHA-256** (un hachage à sens unique, impossible à inverser).
+Une clé fournie par un client n'est acceptée que si son empreinte
+correspond. Cela permet au service de fonctionner "prêt à l'emploi" sans
+configurer de variable d'environnement chez l'hébergeur (utile quand,
+comme sur Render en mode "Blueprint managed", il n'est pas toujours
+possible d'ajouter une variable depuis le tableau de bord).
+
+Pour remplacer la clé sans changer le code (par exemple en local, ou chez
+un hébergeur qui permet les variables d'environnement) :
+
+- `API_KEY=votre-cle python src/server.py` (la clé en clair est hachée au démarrage), ou
+- `API_KEY_SHA256=votre-empreinte python src/server.py` (empreinte déjà calculée).
+
+Pour changer définitivement la clé par défaut : calculez l'empreinte
+SHA-256 de la nouvelle clé et remplacez la constante
+`_EMPREINTE_CLE_API_PAR_DEFAUT` dans `src/server.py`.
 
 ## Déploiement
 
 - `render.yaml` : configuration prête pour un déploiement sur
-  [Render.com](https://render.com) (type "Blueprint"). La variable
-  `API_KEY` y est déclarée avec `sync: false` : sa valeur n'est pas
-  incluse dans ce fichier (raisons de sécurité) et doit être saisie une
-  fois manuellement dans le tableau de bord Render, sur la page du
-  service (elle reste éditable même si le service est "Blueprint
-  managed").
+  [Render.com](https://render.com) (type "Blueprint"). Aucune variable
+  d'environnement à configurer manuellement.
 - `nixpacks.toml` / `Procfile` : configuration prête pour
-  [Railway.app](https://railway.app) (même remarque pour `API_KEY`).
+  [Railway.app](https://railway.app).
