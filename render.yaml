@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: mcp-aides-sociales
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python src/server.py"
+    healthCheckPath: "/"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
