@@ -228,7 +228,14 @@ def _envoyer_email_cle(destinataire: str, cle_api: str, expiration_unix: int | N
     requete = urllib.request.Request(
         "https://api.resend.com/emails",
         data=donnees,
-        headers={"Authorization": f"Bearer {cle_resend}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {cle_resend}",
+            "Content-Type": "application/json",
+            # Sans ceci, urllib envoie "Python-urllib/x.y" par defaut, que le
+            # WAF Cloudflare devant l'API Resend bloque (403, "error code:
+            # 1010") en le prenant pour un signal de bot.
+            "User-Agent": "DroitSocial-API/1.0",
+        },
         method="POST",
     )
     try:
