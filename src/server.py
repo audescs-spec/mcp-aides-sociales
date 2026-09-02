@@ -11,7 +11,12 @@ par la variable d'environnement PORT (8000 par defaut), accessible sur /mcp.
 """
 
 import hashlib
+import hmac
+import json
 import os
+import time
+import urllib.error
+import urllib.request
 from collections import deque
 
 from mcp.server.mcpserver import MCPServer
@@ -92,6 +97,131 @@ async def _accueil(request):
     )
 
 
+def _generer_cle_client(session_id: str, pepper: str) -> str:
+    """Derive une cle d'acces propre a un paiement Stripe, sans base de donnees.
+
+    La cle encode l'identifiant de session Stripe et une signature HMAC-SHA256
+    calculee avec un secret (pepper) connu seulement du serveur. La verification
+    se fait par recalcul de la signature (voir _verifier_cle_client), pas par
+    recherche dans un stockage: le disque gratuit de Render n'est pas persistant
+    entre redemarrages.
+    """
+    signature = hmac.new(pepper.encode(), session_id.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{session_id}.{signature}"
+
+
+def _verifier_cle_client(cle: str, pepper: str) -> bool:
+    session_id, separateur, signature = cle.rpartition(".")
+    if not separateur or not session_id or not signature:
+        return False
+    signature_attendue = hmac.new(pepper.encode(), session_id.encode(), hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(signature, signature_attendue)
+
+
+def _verifier_signature_stripe(
+    payload: bytes, en_tete_signature: str, secret: str, tolerance_secondes: int = 300
+) -> bool:
+    """Verifie une signature de webhook Stripe (algorithme documente par Stripe),
+    sans dependre du SDK officiel `stripe`."""
+    if not en_tete_signature:
+        return False
+    elements = dict(p.split("=", 1) for p in en_tete_signature.split(",") if "=" in p)
+    timestamp = elements.get("t")
+    signature_v1 = elements.get("v1")
+    if not timestamp or not signature_v1:
+        return False
+    payload_signe = f"{timestamp}.".encode() + payload
+    signature_attendue = hmac.new(secret.encode(), payload_signe, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature_attendue, signature_v1):
+        return False
+    try:
+        return abs(time.time() - int(timestamp)) <= tolerance_secondes
+    except ValueError:
+        return False
+
+
+def _envoyer_email_cle(destinataire: str, cle_api: str) -> bool:
+    """Envoie la cle d'acces generee au client par email via Resend.
+
+    Retourne True si Resend a accepte l'envoi. Ne leve jamais d'exception:
+    un email non envoye ne doit pas faire echouer le traitement du webhook
+    (Stripe reessaierait indefiniment). La cle est aussi journalisee (voir
+    l'appelant) comme filet de securite manuel en cas d'echec d'envoi.
+    """
+    cle_resend = os.environ.get("RESEND_API_KEY")
+    if not cle_resend:
+        return False
+    expediteur = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+
+    corps_html = (
+        "<p>Merci pour votre achat.</p>"
+        "<p>Voici votre cle d'acces personnelle au serveur MCP "
+        "<strong>aides-sociales-france</strong> :</p>"
+        f"<p><code>{cle_api}</code></p>"
+        "<p>Ajoutez-la comme en-tete <code>X-API-Key</code> (ou "
+        "<code>Authorization: Bearer &lt;cle&gt;</code>) dans la configuration "
+        "de votre client MCP (Claude Desktop, Cursor...). Voir le README du depot "
+        "pour un exemple complet.</p>"
+    )
+    donnees = json.dumps(
+        {
+            "from": expediteur,
+            "to": [destinataire],
+            "subject": "Votre cle d'acces - aides-sociales-france",
+            "html": corps_html,
+        }
+    ).encode()
+
+    requete = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=donnees,
+        headers={"Authorization": f"Bearer {cle_resend}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(requete, timeout=10) as reponse:
+            return 200 <= reponse.status < 300
+    except urllib.error.HTTPError as erreur:
+        print(f"[paiement] echec envoi email Resend ({erreur.code}): {erreur.read().decode(errors='ignore')}")
+        return False
+    except Exception as erreur:  # reseau indisponible, timeout...
+        print(f"[paiement] echec envoi email Resend: {erreur}")
+        return False
+
+
+async def _webhook_stripe(request):
+    """Recoit les evenements Stripe. Sur un paiement reussi (checkout.session.completed),
+    genere une cle d'acces propre au client et la lui envoie par email."""
+    from starlette.responses import JSONResponse
+
+    secret_webhook = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    pepper = os.environ.get("API_KEY_PEPPER")
+    if not secret_webhook or not pepper:
+        return JSONResponse({"erreur": "Webhook non configure"}, status_code=500)
+
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature", "")
+
+    if not _verifier_signature_stripe(payload, signature, secret_webhook):
+        return JSONResponse({"erreur": "Signature invalide"}, status_code=400)
+
+    evenement = json.loads(payload)
+
+    if evenement.get("type") == "checkout.session.completed":
+        session = evenement.get("data", {}).get("object", {})
+        session_id = session.get("id")
+        email_client = (session.get("customer_details") or {}).get("email")
+
+        if session_id and email_client:
+            cle_client = _generer_cle_client(session_id, pepper)
+            # Filet de securite: toujours visible dans les logs Render, meme
+            # si l'envoi d'email echoue (ex: domaine non verifie sur Resend).
+            print(f"[paiement] nouvelle cle generee - session={session_id} email={email_client} cle={cle_client}")
+            _envoyer_email_cle(email_client, cle_client)
+
+    return JSONResponse({"recu": True})
+
+
 class _AuthentificationParCle:
     """Exige une cle d'acces (API key) sur toutes les routes sauf la page d'accueil "/".
 
@@ -101,16 +231,17 @@ class _AuthentificationParCle:
     ce qui permet de garder l'empreinte dans le code source sans risque.
     """
 
-    def __init__(self, app, empreinte_attendue: str) -> None:
+    _CHEMINS_PUBLICS = ("/", "/webhook/stripe")
+
+    def __init__(self, app, empreinte_attendue: str, pepper: str | None = None) -> None:
         self._app = app
         self._empreinte_attendue = empreinte_attendue
+        self._pepper = pepper
 
     async def __call__(self, scope, receive, send):
-        import hmac
-
         from starlette.responses import PlainTextResponse
 
-        if scope["type"] != "http" or scope["path"] == "/":
+        if scope["type"] != "http" or scope["path"] in self._CHEMINS_PUBLICS:
             await self._app(scope, receive, send)
             return
 
@@ -122,8 +253,11 @@ class _AuthentificationParCle:
                 cle_fournie = auth[7:].strip()
 
         empreinte_fournie = hashlib.sha256(cle_fournie.encode()).hexdigest()
+        cle_valide = bool(cle_fournie) and hmac.compare_digest(empreinte_fournie, self._empreinte_attendue)
+        if not cle_valide and cle_fournie and self._pepper:
+            cle_valide = _verifier_cle_client(cle_fournie, self._pepper)
 
-        if not cle_fournie or not hmac.compare_digest(empreinte_fournie, self._empreinte_attendue):
+        if not cle_valide:
             response = PlainTextResponse(
                 "Cle d'acces manquante ou invalide. Fournissez l'en-tete "
                 "'X-API-Key' ou 'Authorization: Bearer <cle>'.",
@@ -168,7 +302,7 @@ class _LimitationDebit:
 
         from starlette.responses import PlainTextResponse
 
-        if scope["type"] != "http" or scope["path"] == "/":
+        if scope["type"] != "http" or scope["path"] in ("/", "/webhook/stripe"):
             await self._app(scope, receive, send)
             return
 
@@ -207,9 +341,12 @@ def main() -> None:
     else:
         empreinte_attendue = _EMPREINTE_CLE_API_PAR_DEFAUT
 
+    pepper = os.environ.get("API_KEY_PEPPER")
+
     app = server.streamable_http_app(host=host)
     app.add_route("/", _accueil, methods=["GET"])
-    app = _AuthentificationParCle(app, empreinte_attendue)
+    app.add_route("/webhook/stripe", _webhook_stripe, methods=["POST"])
+    app = _AuthentificationParCle(app, empreinte_attendue, pepper)
     app = _LimitationDebit(app)
 
     uvicorn.run(app, host=host, port=port, log_level="info")

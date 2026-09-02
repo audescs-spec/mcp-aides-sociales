@@ -147,7 +147,37 @@ SHA-256 de la nouvelle clé et remplacez la constante
 ## Déploiement
 
 - `render.yaml` : configuration prête pour un déploiement sur
-  [Render.com](https://render.com) (type "Blueprint"). Aucune variable
-  d'environnement à configurer manuellement.
+  [Render.com](https://render.com) (type "Blueprint").
 - `nixpacks.toml` / `Procfile` : configuration prête pour
   [Railway.app](https://railway.app).
+
+## Paiement Stripe et envoi automatique de la clé (pour les mainteneurs)
+
+Le service peut être vendu via un Stripe Payment Link. Un webhook
+(`POST /webhook/stripe`, non protégé par la clé d'accès) écoute
+l'événement `checkout.session.completed` : à chaque paiement réussi, il
+génère une clé d'accès propre au client (dérivée par HMAC-SHA256 de
+l'identifiant de session Stripe et d'un secret serveur — sans base de
+données, donc rien à perdre si le serveur redémarre) et l'envoie par
+email via [Resend](https://resend.com).
+
+Variables d'environnement à définir côté hébergeur (en plus de
+`API_KEY` / `API_KEY_SHA256`, voir plus haut) :
+
+- `STRIPE_WEBHOOK_SECRET` : secret de signature du endpoint webhook
+  (`whsec_...`), fourni par Stripe à la création du webhook.
+- `API_KEY_PEPPER` : secret aléatoire propre au serveur, utilisé pour
+  dériver et vérifier les clés générées par client. À générer une seule
+  fois et ne jamais changer (sinon les clés déjà envoyées deviennent
+  invalides).
+- `RESEND_API_KEY` : clé API [Resend](https://resend.com) utilisée pour
+  l'envoi des emails.
+- `RESEND_FROM_EMAIL` (optionnel) : adresse d'expédition. Par défaut
+  `onboarding@resend.dev`, qui **ne peut envoyer qu'à l'adresse du
+  compte Resend lui-même** tant qu'aucun domaine n'est vérifié — à
+  remplacer par une adresse sur un domaine vérifié avant un lancement
+  public réel.
+
+Filet de sécurité : chaque clé générée est aussi journalisée dans les
+logs du serveur (`[paiement] nouvelle cle generee ...`), pour pouvoir la
+retrouver et la renvoyer manuellement si l'email échoue.

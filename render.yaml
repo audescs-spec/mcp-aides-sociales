@@ -9,3 +9,11 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: API_KEY_PEPPER
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
