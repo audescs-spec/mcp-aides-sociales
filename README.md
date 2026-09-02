@@ -155,11 +155,23 @@ SHA-256 de la nouvelle clé et remplacez la constante
 
 Le service peut être vendu via un Stripe Payment Link. Un webhook
 (`POST /webhook/stripe`, non protégé par la clé d'accès) écoute
-l'événement `checkout.session.completed` : à chaque paiement réussi, il
-génère une clé d'accès propre au client (dérivée par HMAC-SHA256 de
-l'identifiant de session Stripe et d'un secret serveur — sans base de
-données, donc rien à perdre si le serveur redémarre) et l'envoie par
-email via [Resend](https://resend.com).
+deux événements :
+
+- `checkout.session.completed` (mode paiement unique uniquement) : cas
+  historique de l'ancien Payment Link one_time, aujourd'hui désactivé.
+  Génère une clé d'accès **à vie**, dérivée par HMAC-SHA256 de
+  l'identifiant de session Stripe et d'un secret serveur.
+- `invoice.paid` (abonnement mensuel, cas actuel) : à chaque paiement
+  d'abonnement réussi (initial ou renouvellement), génère une clé
+  dérivée de l'identifiant d'abonnement Stripe et **expirant à la fin de
+  la période facturée** (+ 3 jours de marge). Si l'abonnement est annulé
+  ou qu'un paiement échoue, la dernière clé envoyée cesse simplement de
+  fonctionner à son expiration — pas besoin de liste de révocation.
+
+Dans les deux cas, aucune base de données : la clé se vérifie par
+recalcul de sa signature HMAC, pas par recherche dans un stockage (le
+disque gratuit de Render n'est pas persistant entre redémarrages).
+L'envoi se fait par email via [Resend](https://resend.com).
 
 Variables d'environnement à définir côté hébergeur (en plus de
 `API_KEY` / `API_KEY_SHA256`, voir plus haut) :
@@ -174,9 +186,9 @@ Variables d'environnement à définir côté hébergeur (en plus de
   l'envoi des emails.
 - `RESEND_FROM_EMAIL` (optionnel) : adresse d'expédition. Par défaut
   `onboarding@resend.dev`, qui **ne peut envoyer qu'à l'adresse du
-  compte Resend lui-même** tant qu'aucun domaine n'est vérifié — à
-  remplacer par une adresse sur un domaine vérifié avant un lancement
-  public réel.
+  compte Resend lui-même** tant qu'aucun domaine n'est vérifié. En
+  production, utilise une adresse sur un domaine vérifié (ex:
+  `hello@kapsik.com`, vérifié DKIM/SPF/MX sur Resend).
 
 Filet de sécurité : chaque clé générée est aussi journalisée dans les
 logs du serveur (`[paiement] nouvelle cle generee ...`), pour pouvoir la

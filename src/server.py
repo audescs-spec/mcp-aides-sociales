@@ -118,6 +118,41 @@ def _verifier_cle_client(cle: str, pepper: str) -> bool:
     return hmac.compare_digest(signature, signature_attendue)
 
 
+# Marge accordee apres la fin de periode facturee par Stripe (invoice.period_end),
+# pour absorber un leger retard de traitement du webhook ou de nouvelle facture.
+_MARGE_EXPIRATION_ABONNEMENT_SECONDES = 3 * 24 * 3600
+
+
+def _generer_cle_abonnement(subscription_id: str, expiration_unix: int, pepper: str) -> str:
+    """Derive une cle d'acces pour un abonnement, avec expiration integree.
+
+    Contrairement a _generer_cle_client (acces a vie, pour un paiement unique),
+    cette cle expire naturellement a la date encodee: pas besoin de liste de
+    revocation si l'abonnement est annule ou qu'un paiement echoue, le serveur
+    reste sans base de donnees.
+    """
+    message = f"{subscription_id}.{expiration_unix}"
+    signature = hmac.new(pepper.encode(), message.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{message}.{signature}"
+
+
+def _verifier_cle_abonnement(cle: str, pepper: str) -> bool:
+    parties = cle.split(".")
+    if len(parties) != 3:
+        return False
+    subscription_id, expiration_str, signature = parties
+    if not subscription_id or not expiration_str or not signature:
+        return False
+    message = f"{subscription_id}.{expiration_str}"
+    signature_attendue = hmac.new(pepper.encode(), message.encode(), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(signature, signature_attendue):
+        return False
+    try:
+        return time.time() <= int(expiration_str)
+    except ValueError:
+        return False
+
+
 def _verifier_signature_stripe(
     payload: bytes, en_tete_signature: str, secret: str, tolerance_secondes: int = 300
 ) -> bool:
@@ -140,24 +175,42 @@ def _verifier_signature_stripe(
         return False
 
 
-def _envoyer_email_cle(destinataire: str, cle_api: str) -> bool:
+def _envoyer_email_cle(destinataire: str, cle_api: str, expiration_unix: int | None = None) -> bool:
     """Envoie la cle d'acces generee au client par email via Resend.
 
     Retourne True si Resend a accepte l'envoi. Ne leve jamais d'exception:
     un email non envoye ne doit pas faire echouer le traitement du webhook
     (Stripe reessaierait indefiniment). La cle est aussi journalisee (voir
     l'appelant) comme filet de securite manuel en cas d'echec d'envoi.
+
+    Si expiration_unix est fourni (abonnement), la date de validite est
+    mentionnee dans l'email.
     """
     cle_resend = os.environ.get("RESEND_API_KEY")
     if not cle_resend:
         return False
     expediteur = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 
+    if expiration_unix is not None:
+        import datetime
+
+        date_expiration = datetime.datetime.fromtimestamp(
+            expiration_unix, tz=datetime.timezone.utc
+        ).strftime("%d/%m/%Y")
+        ligne_expiration = (
+            f"<p>Cette cle est valable jusqu'au <strong>{date_expiration}</strong> et sera "
+            "automatiquement renouvelee (nouvelle cle envoyee par email) a chaque paiement "
+            "mensuel reussi de votre abonnement.</p>"
+        )
+    else:
+        ligne_expiration = ""
+
     corps_html = (
         "<p>Merci pour votre achat.</p>"
         "<p>Voici votre cle d'acces personnelle au serveur MCP "
         "<strong>aides-sociales-france</strong> :</p>"
         f"<p><code>{cle_api}</code></p>"
+        f"{ligne_expiration}"
         "<p>Ajoutez-la comme en-tete <code>X-API-Key</code> (ou "
         "<code>Authorization: Bearer &lt;cle&gt;</code>) dans la configuration "
         "de votre client MCP (Claude Desktop, Cursor...). Voir le README du depot "
@@ -190,8 +243,17 @@ def _envoyer_email_cle(destinataire: str, cle_api: str) -> bool:
 
 
 async def _webhook_stripe(request):
-    """Recoit les evenements Stripe. Sur un paiement reussi (checkout.session.completed),
-    genere une cle d'acces propre au client et la lui envoie par email."""
+    """Recoit les evenements Stripe.
+
+    - checkout.session.completed en mode paiement unique: genere une cle
+      d'acces a vie (cas historique, ancien Payment Link one_time).
+    - checkout.session.completed en mode abonnement: ignore, gere par
+      invoice.paid ci-dessous (evite d'envoyer deux emails differents pour
+      le meme premier paiement).
+    - invoice.paid: a chaque paiement d'abonnement reussi (initial ou
+      renouvellement), genere une cle expirant a la fin de la periode
+      facturee (+ marge) et l'envoie par email.
+    """
     from starlette.responses import JSONResponse
 
     secret_webhook = os.environ.get("STRIPE_WEBHOOK_SECRET")
@@ -206,9 +268,13 @@ async def _webhook_stripe(request):
         return JSONResponse({"erreur": "Signature invalide"}, status_code=400)
 
     evenement = json.loads(payload)
+    type_evenement = evenement.get("type")
 
-    if evenement.get("type") == "checkout.session.completed":
+    if type_evenement == "checkout.session.completed":
         session = evenement.get("data", {}).get("object", {})
+        if session.get("mode") == "subscription":
+            return JSONResponse({"recu": True})
+
         session_id = session.get("id")
         email_client = (session.get("customer_details") or {}).get("email")
 
@@ -216,8 +282,23 @@ async def _webhook_stripe(request):
             cle_client = _generer_cle_client(session_id, pepper)
             # Filet de securite: toujours visible dans les logs Render, meme
             # si l'envoi d'email echoue (ex: domaine non verifie sur Resend).
-            print(f"[paiement] nouvelle cle generee - session={session_id} email={email_client} cle={cle_client}")
+            print(f"[paiement] nouvelle cle generee (a vie) - session={session_id} email={email_client} cle={cle_client}")
             _envoyer_email_cle(email_client, cle_client)
+
+    elif type_evenement == "invoice.paid":
+        invoice = evenement.get("data", {}).get("object", {})
+        subscription_id = invoice.get("subscription")
+        email_client = invoice.get("customer_email")
+        periode_fin = invoice.get("period_end")
+
+        if subscription_id and email_client and periode_fin:
+            expiration = int(periode_fin) + _MARGE_EXPIRATION_ABONNEMENT_SECONDES
+            cle_client = _generer_cle_abonnement(subscription_id, expiration, pepper)
+            print(
+                f"[paiement] nouvelle cle generee (abonnement) - subscription={subscription_id} "
+                f"email={email_client} expiration={expiration} cle={cle_client}"
+            )
+            _envoyer_email_cle(email_client, cle_client, expiration_unix=expiration)
 
     return JSONResponse({"recu": True})
 
@@ -255,7 +336,12 @@ class _AuthentificationParCle:
         empreinte_fournie = hashlib.sha256(cle_fournie.encode()).hexdigest()
         cle_valide = bool(cle_fournie) and hmac.compare_digest(empreinte_fournie, self._empreinte_attendue)
         if not cle_valide and cle_fournie and self._pepper:
-            cle_valide = _verifier_cle_client(cle_fournie, self._pepper)
+            # Cle d'abonnement (3 parties: subscription_id.expiration.signature)
+            # ou cle a vie issue d'un paiement unique (2 parties).
+            if cle_fournie.count(".") == 2:
+                cle_valide = _verifier_cle_abonnement(cle_fournie, self._pepper)
+            else:
+                cle_valide = _verifier_cle_client(cle_fournie, self._pepper)
 
         if not cle_valide:
             response = PlainTextResponse(
