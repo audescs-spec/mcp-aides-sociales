@@ -5,10 +5,12 @@
 [![smithery badge](https://smithery.ai/badge/aude-scs/mcp-aides-sociales)](https://smithery.ai/servers/aude-scs/mcp-aides-sociales)
 [![MCP Badge](https://lobehub.com/badge/mcp/audescs-spec-mcp-aides-sociales)](https://lobehub.com/mcp/audescs-spec-mcp-aides-sociales)
 
-Ce service estime le **RSA**, la **prime d'activité** et l'**aide au
-logement (APL/ALS/ALF)** pour un foyer français, à partir de quelques
-informations simples : salaire, loyer, statut du logement, nombre
-d'enfants, situation de couple.
+Ce service est une **API/MCP pensée pour les développeurs et les agents
+IA qui l'intègrent** dans leurs propres logiciels — pas un simulateur
+grand public à usage isolé. Elle calcule le **RSA**, la **prime
+d'activité** et l'**aide au logement (APL/ALS/ALF)** pour un foyer
+français, à partir de quelques informations simples : salaire, loyer,
+statut du logement, nombre d'enfants, situation de couple.
 
 Le calcul est fait **entièrement en local**, avec la bibliothèque open
 source [openfisca-france](https://github.com/openfisca/openfisca-france)
@@ -20,16 +22,18 @@ Le calcul repose sur des hypothèses simplificatrices (âge des adultes
 supposé, situation stable sur les derniers mois, etc.). Seule la CAF ou
 la MSA peut donner un montant définitif et exact.
 
-## Adresse du serveur
+## Adresse du serveur et accès
 
 ```
 https://mcp-aides-sociales.onrender.com/mcp
 ```
 
-Ce service est protégé par une **clé d'accès (API key)**. Chaque appel
-doit fournir cette clé, sinon le serveur refuse de répondre. La clé vous
-a été communiquée séparément (elle ne figure pas dans ce dépôt, pour des
-raisons de sécurité).
+Ce service est protégé par une **clé d'accès (API key)** : chaque appel
+doit la fournir, sinon le serveur refuse de répondre. L'accès est un
+abonnement à **29 €/mois**, souscrit ici :
+**[https://buy.stripe.com/9B628q5Pb7t9a0QdurgEg01](https://buy.stripe.com/9B628q5Pb7t9a0QdurgEg01)**.
+Après paiement, une clé d'accès personnelle est envoyée automatiquement
+par email (et renouvelée à chaque paiement mensuel réussi).
 
 ## Installer dans Claude Desktop
 
