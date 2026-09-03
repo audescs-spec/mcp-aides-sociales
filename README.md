@@ -22,6 +22,12 @@ Le calcul repose sur des hypothèses simplificatrices (âge des adultes
 supposé, situation stable sur les derniers mois, etc.). Seule la CAF ou
 la MSA peut donner un montant définitif et exact.
 
+## Crédits
+
+Calculs effectués avec [OpenFisca](https://www.openfisca.fr/), moteur
+socio-fiscal libre et open source sous licence AGPL-3.0. Code source :
+[github.com/openfisca/openfisca-france](https://github.com/openfisca/openfisca-france).
+
 ## Adresse du serveur et accès
 
 ```
@@ -29,11 +35,30 @@ https://mcp-aides-sociales.onrender.com/mcp
 ```
 
 Ce service est protégé par une **clé d'accès (API key)** : chaque appel
-doit la fournir, sinon le serveur refuse de répondre. L'accès est un
-abonnement à **29 €/mois**, souscrit ici :
-**[https://buy.stripe.com/9B628q5Pb7t9a0QdurgEg01](https://buy.stripe.com/9B628q5Pb7t9a0QdurgEg01)**.
-Après paiement, une clé d'accès personnelle est envoyée automatiquement
-par email (et renouvelée à chaque paiement mensuel réussi).
+doit la fournir, sinon le serveur refuse de répondre. Deux paliers,
+100% self-service (aucune validation manuelle) :
+
+| Palier | Quota | Prix | Obtenir une clé |
+|---|---|---|---|
+| **Free** | 50 requêtes/mois | 0 € (sans carte bancaire) | `POST /signup-free` avec `{"email": "..."}` |
+| **Standard** | Illimité | 29 €/mois | [buy.stripe.com/9B628q5Pb7t9a0QdurgEg01](https://buy.stripe.com/9B628q5Pb7t9a0QdurgEg01) |
+
+**Palier Free** — inscription immédiate, sans carte bancaire :
+
+```bash
+curl -X POST https://mcp-aides-sociales.onrender.com/signup-free \
+  -H "Content-Type: application/json" \
+  -d '{"email": "vous@example.com"}'
+```
+
+Une clé (préfixe `free_...`) est envoyée par email. Le quota (50
+requêtes/mois) se réinitialise automatiquement au début de chaque mois.
+Au-delà, le serveur répond `402 Payment Required` avec un message
+invitant à passer au palier Standard — jamais une simple erreur sèche.
+
+**Palier Standard** — après paiement de l'abonnement, une clé d'accès
+personnelle (illimitée) est envoyée automatiquement par email, et
+renouvelée à chaque paiement mensuel réussi.
 
 ## Installer dans Claude Desktop
 
@@ -272,3 +297,31 @@ Variables d'environnement à définir côté hébergeur (en plus de
 Filet de sécurité : chaque clé générée est aussi journalisée dans les
 logs du serveur (`[paiement] nouvelle cle generee ...`), pour pouvoir la
 retrouver et la renvoyer manuellement si l'email échoue.
+
+## Palier gratuit (pour les mainteneurs)
+
+`POST /signup-free` (public, non protégé par la clé d'accès) génère une
+clé du palier gratuit (préfixe `free_...`, HMAC-SHA256 comme les autres
+clés — l'authenticité de la clé se vérifie donc toujours sans base de
+données) et l'envoie par email. Aucune vérification d'email : décision
+assumée tant que le quota bas (50/mois) rend l'abus sans intérêt réel
+(l'alternative gratuite officielle — CAF, 1jeune1solution — existe de
+toute façon) ; à reconsidérer seulement si un abus réel est constaté.
+
+Contrairement aux clés payantes, une clé gratuite a besoin d'un **suivi
+d'usage dans le temps** (nombre de requêtes ce mois-ci) pour appliquer le
+quota — chose qu'une simple signature HMAC ne peut pas faire seule. Seul
+ce compteur utilise un stockage externe : [Upstash Redis](https://upstash.com)
+(palier gratuit, aucune carte requise), interrogé en HTTP simple (`INCR`
+sur la clé `usage:{mois}:{cle}`, expiration de nettoyage à ~40 jours).
+Le mois fait partie du nom de la clé Redis, donc le quota repart
+naturellement à zéro chaque mois, sans logique de reset à écrire.
+
+Variables d'environnement supplémentaires :
+
+- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` : identifiants
+  REST de la base Upstash Redis (palier gratuit du service). Sans ces
+  variables, toute requête avec une clé `free_...` échoue explicitement
+  (503 "service de quota indisponible") plutôt que d'être acceptée par
+  défaut ou de planter — le mécanisme de clé HMAC des paliers payants
+  n'en dépend pas et continue de fonctionner normalement.
