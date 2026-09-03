@@ -14,10 +14,12 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import time
 import urllib.error
 import urllib.request
 from collections import deque
+from datetime import date
 
 from mcp.server.mcpserver import MCPServer
 
@@ -242,6 +244,85 @@ def _verifier_cle_abonnement(cle: str, pepper: str) -> bool:
         return False
 
 
+_LIEN_ABONNEMENT_STRIPE = "https://buy.stripe.com/9B628q5Pb7t9a0QdurgEg01"
+
+# Quota du palier gratuit: nombre de requetes /mcp autorisees par mois et par
+# cle gratuite (toute requete authentifiee compte, pas seulement les appels
+# d'outils - comme pour la limitation de debit par IP ci-dessous).
+_QUOTA_GRATUIT_MENSUEL = 50
+
+
+def _generer_cle_gratuite(pepper: str) -> str:
+    """Derive une cle d'acces pour le palier gratuit, sans base de donnees.
+
+    Prefixe "free_" distinctif (une cle d'abonnement ou a vie ne commence
+    jamais ainsi), suivi d'un identifiant aleatoire et d'une signature
+    HMAC-SHA256. L'authenticite de la cle se verifie par recalcul de cette
+    signature (comme les autres cles) ; seul le SUIVI DU QUOTA (nombre
+    d'appels ce mois-ci) a besoin d'un stockage externe (Upstash), voir
+    _controler_quota_gratuit.
+    """
+    corps = f"free_{secrets.token_hex(12)}"
+    signature = hmac.new(pepper.encode(), corps.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{corps}.{signature}"
+
+
+def _verifier_cle_gratuite(cle: str, pepper: str) -> bool:
+    if not cle.startswith("free_"):
+        return False
+    corps, separateur, signature = cle.rpartition(".")
+    if not separateur or not corps or not signature:
+        return False
+    signature_attendue = hmac.new(pepper.encode(), corps.encode(), hashlib.sha256).hexdigest()[:32]
+    return hmac.compare_digest(signature, signature_attendue)
+
+
+def _mois_courant() -> str:
+    aujourdhui = date.today()
+    return f"{aujourdhui.year:04d}-{aujourdhui.month:02d}"
+
+
+def _upstash_commande(segments: list[str]) -> dict:
+    """Execute une commande Redis simple via l'API REST Upstash (GET path-based).
+
+    Leve RuntimeError si Upstash n'est pas configure ou injoignable: on ne
+    veut jamais confondre "service de quota en panne" avec "quota depasse"
+    (voir l'appelant, _controler_quota_gratuit).
+    """
+    url_base = os.environ.get("UPSTASH_REDIS_REST_URL")
+    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+    if not url_base or not token:
+        raise RuntimeError("Upstash non configure (UPSTASH_REDIS_REST_URL/TOKEN manquants)")
+
+    url = url_base.rstrip("/") + "/" + "/".join(segments)
+    requete = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "DroitSocial-API/1.0"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(requete, timeout=5) as reponse:
+            return json.loads(reponse.read())
+    except Exception as erreur:
+        raise RuntimeError(f"Upstash injoignable: {erreur}") from erreur
+
+
+def _controler_quota_gratuit(cle_gratuite: str) -> int:
+    """Incremente et retourne le nombre d'appels effectues ce mois-ci avec
+    cette cle gratuite. Cle de compteur "usage:{mois}:{cle}": le mois fait
+    partie du nom de la cle, donc le compteur repart naturellement a zero
+    chaque mois (aucune dependance a un TTL pour la justesse du reset). Un
+    TTL de nettoyage (~40 jours) est pose a la premiere utilisation du mois,
+    uniquement pour eviter une accumulation infinie de cles chez Upstash.
+    """
+    cle_compteur = f"usage:{_mois_courant()}:{cle_gratuite}"
+    resultat = _upstash_commande(["incr", cle_compteur])
+    valeur = int(resultat["result"])
+    if valeur == 1:
+        _upstash_commande(["expire", cle_compteur, str(40 * 24 * 3600)])
+    return valeur
+
+
 def _verifier_signature_stripe(
     payload: bytes, en_tete_signature: str, secret: str, tolerance_secondes: int = 300
 ) -> bool:
@@ -264,7 +345,12 @@ def _verifier_signature_stripe(
         return False
 
 
-def _envoyer_email_cle(destinataire: str, cle_api: str, expiration_unix: int | None = None) -> bool:
+def _envoyer_email_cle(
+    destinataire: str,
+    cle_api: str,
+    expiration_unix: int | None = None,
+    palier_gratuit: bool = False,
+) -> bool:
     """Envoie la cle d'acces generee au client par email via Resend.
 
     Retourne True si Resend a accepte l'envoi. Ne leve jamais d'exception:
@@ -273,14 +359,22 @@ def _envoyer_email_cle(destinataire: str, cle_api: str, expiration_unix: int | N
     l'appelant) comme filet de securite manuel en cas d'echec d'envoi.
 
     Si expiration_unix est fourni (abonnement), la date de validite est
-    mentionnee dans l'email.
+    mentionnee dans l'email. Si palier_gratuit est vrai, le texte mentionne
+    le quota mensuel et le lien pour passer au palier payant a la place.
     """
     cle_resend = os.environ.get("RESEND_API_KEY")
     if not cle_resend:
         return False
     expediteur = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 
-    if expiration_unix is not None:
+    if palier_gratuit:
+        ligne_expiration = (
+            f"<p>Cette cle du <strong>palier gratuit</strong> est limitee a "
+            f"<strong>{_QUOTA_GRATUIT_MENSUEL} requetes par mois</strong> (reinitialisees "
+            f"chaque debut de mois). Besoin de plus ? Passez au palier Standard (29&nbsp;&euro;/mois, "
+            f"illimite) : <a href=\"{_LIEN_ABONNEMENT_STRIPE}\">{_LIEN_ABONNEMENT_STRIPE}</a>.</p>"
+        )
+    elif expiration_unix is not None:
         import datetime
 
         date_expiration = datetime.datetime.fromtimestamp(
@@ -295,7 +389,8 @@ def _envoyer_email_cle(destinataire: str, cle_api: str, expiration_unix: int | N
         ligne_expiration = ""
 
     corps_html = (
-        "<p>Merci pour votre achat.</p>"
+        "<p>Merci pour votre inscription.</p>" if palier_gratuit else "<p>Merci pour votre achat.</p>"
+    ) + (
         "<p>Voici votre cle d'acces personnelle au serveur MCP "
         "<strong>aides-sociales-france</strong> :</p>"
         f"<p><code>{cle_api}</code></p>"
@@ -336,6 +431,45 @@ def _envoyer_email_cle(destinataire: str, cle_api: str, expiration_unix: int | N
     except Exception as erreur:  # reseau indisponible, timeout...
         print(f"[paiement] echec envoi email Resend: {erreur}")
         return False
+
+
+_EMAIL_LONGUEUR_MAX = 254
+
+
+async def _inscription_gratuite(request):
+    """Inscription self-service au palier gratuit: pas de compte Stripe, pas
+    de verification d'email (accepte comme risque connu tant que le quota
+    bas la rend peu interessante a abuser - a reconsiderer si abus constate).
+    """
+    from starlette.responses import JSONResponse
+
+    pepper = os.environ.get("API_KEY_PEPPER")
+    if not pepper:
+        return JSONResponse({"erreur": "Service non configure"}, status_code=500)
+
+    try:
+        corps = await request.json()
+    except Exception:
+        return JSONResponse({"erreur": "Corps JSON invalide, attendu: {\"email\": \"...\"}"}, status_code=400)
+
+    email = corps.get("email") if isinstance(corps, dict) else None
+    if (
+        not isinstance(email, str)
+        or "@" not in email
+        or len(email) < 5
+        or len(email) > _EMAIL_LONGUEUR_MAX
+    ):
+        return JSONResponse({"erreur": "email invalide ou manquant"}, status_code=400)
+    email = email.strip()
+
+    cle_gratuite = _generer_cle_gratuite(pepper)
+    print(f"[gratuit] nouvelle cle generee (palier gratuit) - email={email} cle={cle_gratuite}")
+    envoye = _envoyer_email_cle(email, cle_gratuite, palier_gratuit=True)
+    if not envoye:
+        return JSONResponse(
+            {"erreur": "Echec de l'envoi de l'email. Reessayez plus tard."}, status_code=502
+        )
+    return JSONResponse({"ok": True, "message": f"Cle envoyee a {email}."})
 
 
 async def _webhook_stripe(request):
@@ -408,7 +542,7 @@ class _AuthentificationParCle:
     ce qui permet de garder l'empreinte dans le code source sans risque.
     """
 
-    _CHEMINS_PUBLICS = ("/", "/webhook/stripe")
+    _CHEMINS_PUBLICS = ("/", "/webhook/stripe", "/signup-free")
 
     def __init__(self, app, empreinte_attendue: str, pepper: str | None = None) -> None:
         self._app = app
@@ -431,13 +565,51 @@ class _AuthentificationParCle:
 
         empreinte_fournie = hashlib.sha256(cle_fournie.encode()).hexdigest()
         cle_valide = bool(cle_fournie) and hmac.compare_digest(empreinte_fournie, self._empreinte_attendue)
-        if not cle_valide and cle_fournie and self._pepper:
+        # Cle du palier gratuit: prefixe distinctif "free_", verifiee en premier
+        # car elle contient aussi un point (ne pas la laisser tomber dans la
+        # logique par nombre de points ci-dessous). Le chemin des cles
+        # payantes (abonnement/a vie) reste inchange, aucune de ces cles ne
+        # commence par "free_".
+        est_cle_gratuite = not cle_valide and cle_fournie and cle_fournie.startswith("free_")
+        if not cle_valide and cle_fournie and self._pepper and not est_cle_gratuite:
             # Cle d'abonnement (3 parties: subscription_id.expiration.signature)
             # ou cle a vie issue d'un paiement unique (2 parties).
             if cle_fournie.count(".") == 2:
                 cle_valide = _verifier_cle_abonnement(cle_fournie, self._pepper)
             else:
                 cle_valide = _verifier_cle_client(cle_fournie, self._pepper)
+
+        if est_cle_gratuite and self._pepper:
+            if not _verifier_cle_gratuite(cle_fournie, self._pepper):
+                response = PlainTextResponse(
+                    "Cle d'acces manquante ou invalide. Fournissez l'en-tete "
+                    "'X-API-Key' ou 'Authorization: Bearer <cle>'.",
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
+            try:
+                nombre_appels = _controler_quota_gratuit(cle_fournie)
+            except RuntimeError as erreur:
+                print(f"[quota] service de quota indisponible: {erreur}")
+                response = PlainTextResponse(
+                    "Service de quota temporairement indisponible. Reessayez dans "
+                    "quelques instants.",
+                    status_code=503,
+                )
+                await response(scope, receive, send)
+                return
+            if nombre_appels > _QUOTA_GRATUIT_MENSUEL:
+                response = PlainTextResponse(
+                    f"Quota gratuit mensuel atteint ({_QUOTA_GRATUIT_MENSUEL} requetes/mois). "
+                    f"Il sera reinitialise le mois prochain, ou passez des maintenant au palier "
+                    f"Standard (29 EUR/mois, illimite) : {_LIEN_ABONNEMENT_STRIPE}",
+                    status_code=402,
+                )
+                await response(scope, receive, send)
+                return
+            await self._app(scope, receive, send)
+            return
 
         if not cle_valide:
             response = PlainTextResponse(
@@ -528,6 +700,7 @@ def main() -> None:
     app = server.streamable_http_app(host=host)
     app.add_route("/", _accueil, methods=["GET"])
     app.add_route("/webhook/stripe", _webhook_stripe, methods=["POST"])
+    app.add_route("/signup-free", _inscription_gratuite, methods=["POST"])
     app = _AuthentificationParCle(app, empreinte_attendue, pepper)
     app = _LimitationDebit(app)
 
