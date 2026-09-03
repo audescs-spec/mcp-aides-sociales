@@ -5,9 +5,10 @@
 [![smithery badge](https://smithery.ai/badge/aude-scs/mcp-aides-sociales)](https://smithery.ai/servers/aude-scs/mcp-aides-sociales)
 [![MCP Badge](https://lobehub.com/badge/mcp/audescs-spec-mcp-aides-sociales)](https://lobehub.com/mcp/audescs-spec-mcp-aides-sociales)
 
-Ce service estime le **RSA** et la **prime d'activité** pour un foyer
-français, à partir de quelques informations simples : salaire, loyer,
-statut du logement, nombre d'enfants, situation de couple.
+Ce service estime le **RSA**, la **prime d'activité** et l'**aide au
+logement (APL/ALS/ALF)** pour un foyer français, à partir de quelques
+informations simples : salaire, loyer, statut du logement, nombre
+d'enfants, situation de couple.
 
 Le calcul est fait **entièrement en local**, avec la bibliothèque open
 source [openfisca-france](https://github.com/openfisca/openfisca-france)
@@ -76,12 +77,13 @@ raisons de sécurité).
 
 ## Exemple de question à poser une fois connecté
 
-> « J'habite seul(e), je gagne 900 euros nets par mois, je paie 500 euros
-> de loyer et je n'ai pas d'enfant. Est-ce que j'ai droit au RSA ou à la
-> prime d'activité, et pour quel montant ? »
+> « J'habite seul(e) à Paris, je gagne 900 euros nets par mois (environ
+> 1150 euros bruts), je paie 500 euros de loyer et je n'ai pas d'enfant.
+> Est-ce que j'ai droit au RSA, à la prime d'activité, et à l'APL, et
+> pour quel montant ? »
 
-L'assistant utilisera automatiquement l'outil `calculer_aides_sociales`
-et répondra avec les montants mensuels estimés.
+L'assistant utilisera automatiquement les outils `calculer_aides_sociales`
+et `calculer_apl` et répondra avec les montants mensuels estimés.
 
 ## Note technique : premier appel parfois lent
 
@@ -90,7 +92,9 @@ depuis un moment, il peut mettre 30 à 60 secondes à répondre à la toute
 première question (le temps de "se réveiller"). Les questions suivantes
 sont ensuite rapides.
 
-## L'outil exposé : `calculer_aides_sociales`
+## Les outils exposés
+
+### `calculer_aides_sociales` (RSA + prime d'activité)
 
 Paramètres :
 
@@ -102,9 +106,75 @@ Paramètres :
 - `nombre_enfants` (entier) : nombre d'enfants à charge.
 - `en_couple` (vrai/faux).
 - `salaire_net_mensuel_conjoint` (nombre, optionnel) : à fournir si `en_couple` est vrai.
+- `code_insee_commune` (texte, optionnel) : code INSEE (depcom) de la
+  commune, 5 caractères (ex: `75056` pour Paris). Affine une vérification
+  interne au calcul du forfait logement du RSA (zone APL). En son
+  absence, la zone 2 est utilisée par défaut pour cette vérification
+  uniquement — cela ne change généralement pas le RSA/la prime
+  d'activité renvoyés (voir *Le forfait logement du RSA* ci-dessous).
 
 Retourne le mois de calcul, le RSA mensuel estimé, la prime d'activité
 mensuelle estimée, et les hypothèses retenues pour le calcul.
+
+### `calculer_apl` (aide au logement : APL, ALS ou ALF selon éligibilité)
+
+Paramètres :
+
+- `salaire_brut_mensuel` (nombre) : salaire **brut** mensuel du demandeur
+  (avant cotisations, en haut du bulletin de paie) — **pas** le salaire
+  net utilisé par `calculer_aides_sociales`. Nécessaire pour qu'openfisca-france
+  recalcule correctement, via son propre moteur de paie, le revenu
+  imposable utilisé dans la base ressources "temps réel" de l'aide au
+  logement (réforme 2021).
+- `loyer_mensuel` (nombre) : loyer réellement payé, hors charges. En cas
+  de colocation, indiquer uniquement la part personnelle.
+- `code_insee_commune` (texte, **obligatoire pour cet outil**) : code
+  INSEE de la commune, 5 caractères — pas le code postal. La zone APL en
+  est déduite automatiquement (fichier de zonage embarqué dans
+  openfisca-france, 37 000+ communes, aucun appel réseau). Un code
+  inconnu est rejeté explicitement plutôt que de retomber sur une zone
+  par défaut.
+- `statut_occupation_logement` (texte) : `proprietaire`, `locataire_hlm`,
+  `locataire_vide`, `locataire_meuble`, `loge_gratuitement`,
+  `sans_domicile` sont calculés (les 3 derniers donnent légitimement
+  0 €, non-éligibilité réelle). `primo_accedant` et `locataire_foyer`
+  sont **hors périmètre** : l'outil renvoie une erreur explicite plutôt
+  qu'un montant approximatif (voir *Ce que `calculer_apl` ne couvre
+  pas*).
+- `nombre_enfants`, `en_couple`, `salaire_brut_mensuel_conjoint` :
+  identiques en principe à `calculer_aides_sociales` (mais en brut).
+- `en_colocation` (vrai/faux, optionnel, défaut faux) : applique le
+  plafond de loyer réduit prévu pour les colocataires.
+
+Retourne le mois de calcul, l'aide au logement mensuelle estimée, le
+dispositif applicable (APL, ALS ou ALF), les hypothèses de calcul, et un
+descriptif explicite de ce que le calcul couvre ou non.
+
+#### Ce que `calculer_apl` ne couvre pas
+
+- **Accession à la propriété avec prêt en cours** (`primo_accedant`) :
+  dépend de la date exacte du prêt, non collectée ici, et n'est presque
+  plus ouvert aux nouveaux prêts depuis 2018.
+- **Logement-foyer / résidence universitaire ou CROUS**
+  (`locataire_foyer`) : openfisca-france marque lui-même ce statut
+  "non calculable" par la formule standard.
+- **Revenus non salariés** : indépendants, chômage indemnisé, retraite,
+  pension d'invalidité, revenus du patrimoine ne sont pas modélisés —
+  seul un revenu salarié stable est pris en compte.
+- Personnes âgées/handicapées hébergées à titre onéreux, chambres
+  meublées spécifiquement.
+
+### Le forfait logement du RSA (pourquoi RSA et APL s'additionnent)
+
+Le RSA renvoyé par `calculer_aides_sociales` intègre déjà un **forfait
+logement** : une déduction forfaitaire **fixe**, prévue par la loi
+(environ 12 % du montant de base du RSA pour une personne seule),
+appliquée dès que le foyer est logé (loyer payé, logé gratuitement, ou
+propriétaire). **Ce n'est pas une estimation du montant réel d'aide au
+logement** — c'est un taux légal indépendant, donc le RSA renvoyé ici et
+le montant renvoyé par `calculer_apl` peuvent bien être additionnés :
+un allocataire perçoit réellement le RSA (déjà minoré de ce forfait
+fixe) **plus** son APL/ALS/ALF entière.
 
 ## Faire tourner ce serveur soi-même (en local)
 

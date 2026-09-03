@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.audescs-spec/mcp-aides-sociales",
   "title": "Aides sociales françaises",
-  "description": "Estime le RSA et la prime d'activite (openfisca-france), calcul 100% local.",
-  "version": "1.0.0",
+  "description": "Estime le RSA, la prime d'activite et l'APL (openfisca-france), calcul local.",
+  "version": "1.1.0",
   "repository": {
     "url": "https://github.com/audescs-spec/mcp-aides-sociales",
     "source": "github",

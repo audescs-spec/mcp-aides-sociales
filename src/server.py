@@ -21,6 +21,7 @@ from collections import deque
 
 from mcp.server.mcpserver import MCPServer
 
+from calcul import calculer_apl as _calculer_apl
 from calcul import calculer_rsa_prime_activite
 
 # Empreinte SHA-256 de la cle d'acces par defaut du service (pas la cle en
@@ -51,10 +52,15 @@ def calculer_aides_sociales(
     nombre_enfants: int,
     en_couple: bool,
     salaire_net_mensuel_conjoint: float | None = None,
+    code_insee_commune: str | None = None,
 ) -> dict:
     """Estime le RSA et la prime d'activite mensuels pour un foyer francais.
 
-    Calcul 100% local via openfisca-france (aucun appel reseau externe).
+    Calcul 100% local via openfisca-france (aucun appel reseau externe). Le
+    RSA integre un forfait logement (deduction forfaitaire fixe prevue par la
+    loi, ~12% du montant de base pour une personne seule) - ce n'est pas une
+    estimation du montant reel d'aide au logement, donc ce RSA peut etre
+    additionne sans probleme au resultat de l'outil calculer_apl.
 
     Args:
         salaire_net_mensuel: Salaire net mensuel du demandeur, en euros (0 si sans emploi).
@@ -66,6 +72,12 @@ def calculer_aides_sociales(
         en_couple: True si le demandeur vit en couple (marie, pacse ou concubin), False sinon.
         salaire_net_mensuel_conjoint: Salaire net mensuel du conjoint, en euros. A fournir
             uniquement si en_couple est True (0 ou absent si le conjoint n'a pas de revenu).
+        code_insee_commune: Code INSEE (depcom) de la commune, 5 caracteres (ex: "75056"
+            pour Paris), optionnel. Affine une verification interne au calcul du forfait
+            logement (zone APL). En son absence, la zone 2 est utilisee par defaut pour
+            cette verification uniquement - cela ne change generalement pas le RSA/la
+            prime d'activite renvoyes (le forfait est un montant fixe, independant de la
+            zone, sauf dans de rares cas limites).
 
     Returns:
         Un dictionnaire avec le mois de calcul, le RSA mensuel estime, la prime d'activite
@@ -79,6 +91,7 @@ def calculer_aides_sociales(
             nombre_enfants=nombre_enfants,
             en_couple=en_couple,
             salaire_net_mensuel_conjoint=salaire_net_mensuel_conjoint,
+            code_insee_commune=code_insee_commune,
         )
     except ValueError as erreur:
         return {"erreur": str(erreur)}
@@ -86,6 +99,82 @@ def calculer_aides_sociales(
         # Filet de securite: une erreur inattendue (bug, cas limite non
         # prevu dans openfisca-france...) ne doit jamais faire planter le
         # serveur ni exposer de details internes au client.
+        return {"erreur": "Une erreur inattendue est survenue lors du calcul."}
+
+
+@server.tool()
+def calculer_apl(
+    salaire_brut_mensuel: float,
+    loyer_mensuel: float,
+    code_insee_commune: str,
+    statut_occupation_logement: str,
+    nombre_enfants: int,
+    en_couple: bool,
+    en_colocation: bool = False,
+    salaire_brut_mensuel_conjoint: float | None = None,
+) -> dict:
+    """Estime l'aide au logement (APL/ALS/ALF, selon eligibilite) pour un foyer francais.
+
+    Calcul 100% local via openfisca-france (aucun appel reseau externe). La
+    zone APL est deduite automatiquement du code INSEE de la commune fourni
+    (fichier de zonage embarque dans openfisca-france), inutile de la
+    connaitre ou de la deviner vous-meme.
+
+    IMPORTANT - salaire BRUT et non net : contrairement a l'outil
+    calculer_aides_sociales (RSA/prime d'activite), cet outil demande le
+    salaire BRUT ("salaire de base", avant cotisations sociales, visible en
+    haut du bulletin de paie). C'est necessaire pour qu'openfisca-france
+    puisse recalculer correctement, via son propre moteur de paie, le revenu
+    imposable utilise dans la base ressources "temps reel" de l'aide au
+    logement (reforme 2021) : fournir le salaire net donnerait un resultat
+    incorrect.
+
+    PERIMETRE NON COUVERT (renvoie une erreur explicite plutot qu'un montant
+    approximatif) : accession a la propriete avec pret en cours
+    (statut_occupation_logement="primo_accedant") et logement-foyer /
+    residence universitaire ou CROUS (statut_occupation_logement=
+    "locataire_foyer"). Non modelise non plus : travailleurs independants,
+    chomage indemnise, retraite, pension d'invalidite, revenus du
+    patrimoine, personnes agees/handicapees hebergees a titre onereux -
+    seul un revenu salarie stable est pris en compte.
+
+    Args:
+        salaire_brut_mensuel: Salaire BRUT mensuel du demandeur, en euros (0 si sans emploi).
+        loyer_mensuel: Loyer mensuel reellement paye (hors charges). En cas de colocation,
+            indiquer uniquement la part personnelle du demandeur.
+        code_insee_commune: Code INSEE (depcom) de la commune du logement, 5 caracteres
+            (ex: "75056" pour Paris, "69123" pour Lyon). Ce n'est PAS le code postal.
+        statut_occupation_logement: Statut du logement. Valeurs possibles: "proprietaire",
+            "locataire_hlm", "locataire_vide", "locataire_meuble", "loge_gratuitement",
+            "sans_domicile" (calcules ; les 3 derniers donnent legitimement 0, non-eligibilite
+            reelle), ou "primo_accedant"/"locataire_foyer" (hors perimetre, voir ci-dessus).
+        nombre_enfants: Nombre d'enfants a charge dans le foyer.
+        en_couple: True si le demandeur vit en couple (marie, pacse ou concubin), False sinon.
+        en_colocation: True si le logement est en colocation (le calcul applique alors le
+            plafond de loyer reduit prevu pour les colocataires, sur la base de la part
+            personnelle de loyer indiquee).
+        salaire_brut_mensuel_conjoint: Salaire BRUT mensuel du conjoint, en euros. A fournir
+            uniquement si en_couple est True (0 ou absent si le conjoint n'a pas de revenu).
+
+    Returns:
+        Un dictionnaire avec le mois de calcul, l'aide au logement mensuelle estimee, le
+        dispositif applicable (APL, ALS ou ALF), les hypotheses de calcul, et ce que le
+        calcul couvre ou ne couvre pas.
+    """
+    try:
+        return _calculer_apl(
+            salaire_brut_mensuel=salaire_brut_mensuel,
+            loyer_mensuel=loyer_mensuel,
+            code_insee_commune=code_insee_commune,
+            statut_occupation_logement=statut_occupation_logement,
+            nombre_enfants=nombre_enfants,
+            en_couple=en_couple,
+            en_colocation=en_colocation,
+            salaire_brut_mensuel_conjoint=salaire_brut_mensuel_conjoint,
+        )
+    except ValueError as erreur:
+        return {"erreur": str(erreur)}
+    except Exception:
         return {"erreur": "Une erreur inattendue est survenue lors du calcul."}
 
 
