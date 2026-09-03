@@ -1,6 +1,7 @@
 # Serveur MCP - Aides sociales françaises
 
 [![audescs-spec/mcp-aides-sociales MCP server](https://glama.ai/mcp/servers/audescs-spec/mcp-aides-sociales/badges/score.svg)](https://glama.ai/mcp/servers/audescs-spec/mcp-aides-sociales)
+[![AllMCPs Verified](https://allmcps.com/api/badge/aides-sociales-francaises?style=shield)](https://allmcps.com/mcp/aides-sociales-francaises)
 
 Ce service estime le **RSA** et la **prime d'activité** pour un foyer
 français, à partir de quelques informations simples : salaire, loyer,
